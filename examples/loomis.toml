@@ -1,7 +1,19 @@
 [[server]]
 listen = "127.0.0.1:3000"
-server_name = ["localhost"]
+server_name = ["localhost", "site.localhost"]
 
   [[server.location]]
   path = "/"
   root = "../example"
+
+  [[server.location]]
+  path = "/docs"
+  root = "../example/docs"
+
+[[server]]
+listen = "127.0.0.1:3000"
+server_name = ["admin.localhost"]
+
+  [[server.location]]
+  path = "/"
+  root = "../example/admin"
