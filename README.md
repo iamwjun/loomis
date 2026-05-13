@@ -1,97 +1,124 @@
 # Loomis
 
-`Loomis` is a foundational library for web server applications built in Rust. Its goal is to provide server-side projects with a lightweight, composable, and maintainable set of common abstractions.
+`Loomis` is a lightweight nginx-like HTTP server written in Rust.
 
-Rather than being an all-in-one framework, `Loomis` is positioned as an infrastructure-oriented library. It is meant to consolidate the common startup, organization, extension, and operational concerns of web services, so application code can stay focused on APIs and domain logic.
+It is configuration-driven and focuses on the parts that make nginx useful in small deployments:
 
-## Project Positioning
+- multiple `server` blocks
+- `Host`-based virtual hosts
+- longest-prefix `location` matching
+- static file serving
+- `proxy_pass` reverse proxying
+- access logs
+- `Ctrl+C` graceful shutdown
 
-In a typical web service, beyond business logic itself, teams usually end up solving the same set of problems repeatedly:
+It is intentionally smaller than nginx and does not try to be config-compatible with it.
 
-- Application startup and lifecycle management
-- Configuration loading and environment separation
-- Routing, request handling, and response abstraction
-- Error modeling and standardized error responses
-- Logging, tracing, and observability
-- Middleware support
-- Graceful shutdown and runtime resource management
-- Testing support and local development ergonomics
+## Features
 
-`Loomis` aims to extract those foundational capabilities that every project needs, but no team wants to keep reimplementing, into a reusable Rust library that can serve as the base layer for web server applications.
+- TOML config file loaded with `--config <path>`
+- Multiple `server` blocks on the same or different listen addresses
+- Static `location` blocks with `root` and configurable `index`
+- HTTP reverse proxy `location` blocks with `proxy_pass`
+- Extensionless `.html` fallback for static routes such as `/about -> about.html`
+- Path traversal protection
+- Access log lines including host, method, target, status, duration, and upstream
 
-## Design Goals
+## Quick Start
 
-- Type safety: use Rust's type system to enforce error boundaries and interface contracts.
-- Modularity: keep capabilities decoupled and composable instead of binding everything to one execution model.
-- Extensibility: make it easy to integrate middleware, centralized error handling, logging, and monitoring.
-- Production-oriented: account for configuration, observability, stability, and lifecycle management from the start.
-- Deliberate scope: focus on shared foundational capabilities without intruding on business-specific models.
-
-## Use Cases
-
-`Loomis` is suitable as a foundational library for:
-
-- Internal API services
-- Backend services for admin systems
-- Microservices or lightweight service nodes
-- Rust web applications that need a unified service foundation
-- Teams building their own server-side infrastructure in Rust
-
-## Current Status
-
-The repository is still in an early initialization stage. The implementation is intentionally minimal, and the core API and module boundaries have not been fully developed yet.
-
-That means:
-
-- The overall direction of the project is already defined
-- The repository has been set up as a library crate
-- The foundational pieces for a web server base library will be added incrementally
-- At this stage, it is better suited as a structural starting point than as a production-ready solution
-
-If you plan to continue building on this repository, these module boundaries are good candidates to define first:
-
-- `app`: application entrypoint, boot flow, and lifecycle management
-- `config`: configuration loading, environment variables, and validation
-- `http`: request/response abstractions and common response structures
-- `error`: error types, conversions, and standardized error responses
-- `middleware`: cross-cutting concerns such as logging, auth, CORS, and rate limiting
-- `observability`: logging, tracing, and metrics
-- `server`: listeners, graceful shutdown, and runtime parameter management
-
-## Usage
-
-The current implementation provides a minimal HTML server that serves `.html` and `.htm` files from a local directory.
-
-### Run the bundled example
+Start a demo upstream server for `/api`:
 
 ```bash
-cargo run
+python3 -m http.server 4000 --bind 127.0.0.1 --directory example/upstream
 ```
 
-By default, Loomis serves files from `./example` on `http://127.0.0.1:3000/`.
-
-### Use a custom directory or port
+Start Loomis with the bundled config:
 
 ```bash
-cargo run -- --path ./example --port 8080
+cargo run -- --config examples/loomis.toml
 ```
 
-Available CLI options:
+Then try the sample routes:
 
-- `--path <html-dir>`: root directory to serve. The directory must exist.
-- `--port <port>`: TCP port to bind to on `127.0.0.1`.
-- `--help`, `-h`: print the command usage.
+```bash
+curl -H 'Host: localhost' http://127.0.0.1:3000/docs/
+curl -H 'Host: admin.localhost' http://127.0.0.1:3000/
+curl -H 'Host: localhost' http://127.0.0.1:3000/api/users/
+```
 
-### Routing behavior
+## Example Config
 
-Loomis currently supports `GET` requests only and only serves HTML files. Request paths are resolved using these rules:
+```toml
+[[server]]
+listen = "127.0.0.1:3000"
+server_name = ["localhost", "site.localhost"]
 
-- `/` resolves to `index.html`
-- `/about` resolves to `about.html` or `about/index.html`
-- `/docs/` resolves to `docs/index.html`
-- path traversal such as `/../secret.html` is rejected
+  [[server.location]]
+  path = "/"
+  root = "../example"
 
-### Use as a library
+  [[server.location]]
+  path = "/docs"
+  root = "../example/docs"
+
+  [[server.location]]
+  path = "/api"
+  proxy_pass = "http://127.0.0.1:4000"
+
+[[server]]
+listen = "127.0.0.1:3000"
+server_name = ["admin.localhost"]
+
+  [[server.location]]
+  path = "/"
+  root = "../example/admin"
+```
+
+## Routing Rules
+
+- `server` selection is based on the `Host` header.
+- If no named `server` matches, Loomis falls back to the default server on that listener.
+- `location` selection uses longest prefix matching.
+- Static `root` locations strip the matched location prefix before resolving the filesystem path.
+- If a static request has no extension, Loomis tries the exact file, then `*.html`, then directory index candidates.
+- `proxy_pass` rewrites the request path relative to the matched location prefix and preserves the query string.
+
+## CLI
+
+Config-driven mode:
+
+```bash
+cargo run -- --config examples/loomis.toml
+```
+
+Legacy single-site static mode:
+
+```bash
+cargo run -- --path ./example --port 3000
+```
+
+Available options:
+
+- `--config <path>`: start from a Loomis TOML config file
+- `--path <dir>`: start the legacy single-site static server
+- `--port <port>`: override the legacy static server port
+- `--help`, `-h`: print usage
+
+## Library Usage
+
+Run the full config-driven server:
+
+```rust
+use std::error::Error;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let config = loomis::LoomisConfig::load_from_path("examples/loomis.toml")?;
+    loomis::serve_config(&config)?;
+    Ok(())
+}
+```
+
+Run the legacy single-site static server:
 
 ```rust
 fn main() -> Result<(), loomis::ServerError> {
@@ -99,52 +126,27 @@ fn main() -> Result<(), loomis::ServerError> {
 }
 ```
 
-`serve_html` validates the root directory, binds to `127.0.0.1:<port>`, and serves matching HTML files until the process exits.
+## Limitations
+
+Loomis currently does not implement:
+
+- TLS / HTTPS
+- config hot reload
+- load balancing or health checks
+- gzip, caching, auth, or rate limiting
+- chunked request bodies
+- full nginx configuration syntax compatibility
 
 ## Development
 
-After cloning the repository, you can build and test it like a standard Rust library:
+Build and test:
 
 ```bash
 cargo build
 cargo test
 ```
 
-If the project evolves into a more complete server-side foundation library, these areas are worth prioritizing:
-
-1. Crate-level module structure
-2. A shared error model
-3. Configuration and application startup flow
-4. HTTP abstractions and middleware support
-5. Logging and tracing integration
-6. Example applications and integration tests
-
-## Project Structure
-
-The current repository structure is still quite simple:
-
-```text
-.
-├── Cargo.toml
-├── README.md
-├── example
-│   └── index.html
-└── src
-    ├── lib.rs
-    └── main.rs
-```
-
-As more foundational capabilities are added, the directory layout should evolve into a clearer module structure to support long-term maintenance and extension.
-
-## Vision
-
-`Loomis` is intended to become a practical starting point for Rust web server applications:
-
-- More efficient than rebuilding service infrastructure from scratch
-- More controllable than adopting a heavyweight framework
-- More consistent than scattering utility code across projects
-
-If your goal is to establish a maintainable long-term foundation for Rust server-side development, this repository is a suitable place to start.
+The implementation plan for the nginx-like expansion lives at `docs/nginx-like-plan.md`.
 
 ## License
 

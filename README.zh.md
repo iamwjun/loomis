@@ -1,104 +1,152 @@
 # Loomis
 
-`Loomis` 是一个使用 Rust 构建的 Web Server 应用基础库，目标是为服务端项目提供一层轻量、可组合、可维护的通用能力抽象。
+`Loomis` 是一个用 Rust 编写的轻量级类 nginx HTTP 服务器。
 
-它的定位不是“大而全”的框架，而是一个更偏基础设施的 library：负责沉淀 Web 服务常见的启动、组织、扩展和治理能力，让上层业务代码可以更专注于接口和领域逻辑。
+它采用配置驱动，聚焦在 nginx 在小型部署里最有价值的能力：
 
-## 项目定位
+- 多个 `server` 块
+- 基于 `Host` 的虚拟主机
+- 最长前缀 `location` 匹配
+- 静态文件服务
+- `proxy_pass` 反向代理
+- 访问日志
+- `Ctrl+C` 优雅退出
 
-在典型的 Web 服务开发中，除了具体业务处理逻辑外，通常还需要重复处理这些问题：
+它有意保持轻量，不追求和 nginx 配置语法完全兼容。
 
-- 应用启动与生命周期管理
-- 配置加载与环境隔离
-- 路由、请求处理与响应封装
-- 错误建模与统一返回
-- 日志、追踪与可观测性
-- 中间件机制
-- 优雅关闭与运行时资源管理
-- 测试支撑与本地开发体验
+## 当前能力
 
-`Loomis` 的目标就是把这些“每个项目都会写、但又不希望每个项目都重写一遍”的基础能力抽象出来，形成一个适合作为 Web Server 应用底座的 Rust 库。
+- 通过 `--config <path>` 加载 TOML 配置
+- 支持同一监听地址或不同监听地址上的多个 `server`
+- 静态 `location`，支持 `root` 和自定义 `index`
+- HTTP 反向代理 `location`，支持 `proxy_pass`
+- 静态路由保留无扩展名 `.html` 回退，例如 `/about -> about.html`
+- 路径穿越防护
+- 访问日志包含 host、method、target、status、耗时和 upstream
 
-## 设计目标
+## 快速开始
 
-- 类型安全：充分利用 Rust 的类型系统约束错误边界与接口契约。
-- 模块化：各能力尽量解耦，支持按需组合，而不是强绑定到单一运行模式。
-- 可扩展：方便接入中间件、统一错误处理、日志与监控组件。
-- 面向生产：从一开始就考虑配置、可观测性、稳定性和生命周期管理。
-- 保持克制：优先提供通用底座能力，不侵入具体业务模型。
+先启动一个给 `/api` 使用的 demo upstream：
 
-## 适用场景
+```bash
+python3 -m http.server 4000 --bind 127.0.0.1 --directory example/upstream
+```
 
-`Loomis` 适合用作以下项目的基础库：
+再启动 Loomis：
 
-- 内部 API 服务
-- 后台管理系统服务端
-- 微服务或轻量服务节点
-- 需要统一服务规范的 Rust Web 应用
-- 想基于 Rust 自建服务端基础设施的团队
+```bash
+cargo run -- --config examples/loomis.toml
+```
 
-## 当前状态
+然后测试三条示例链路：
 
-当前仓库仍处于初始化阶段，代码实现还比较精简，核心 API 和模块划分尚未完全展开。
+```bash
+curl -H 'Host: localhost' http://127.0.0.1:3000/docs/
+curl -H 'Host: admin.localhost' http://127.0.0.1:3000/
+curl -H 'Host: localhost' http://127.0.0.1:3000/api/users/
+```
 
-这意味着：
+## 示例配置
 
-- 项目方向已经明确
-- 仓库已经按 library crate 形式建立
-- 后续会逐步补齐 Web Server 底座相关能力
-- 现阶段更适合作为基础骨架与设计起点，而不是直接投入生产
+```toml
+[[server]]
+listen = "127.0.0.1:3000"
+server_name = ["localhost", "site.localhost"]
 
-如果你准备基于这个仓库继续开发，建议优先明确以下几个模块边界：
+  [[server.location]]
+  path = "/"
+  root = "../example"
 
-- `app`：应用入口、启动流程、生命周期管理
-- `config`：配置加载、环境变量、配置校验
-- `http`：请求/响应抽象、通用返回结构
-- `error`：错误类型、错误转换、统一错误响应
-- `middleware`：日志、鉴权、CORS、限流等横切能力
-- `observability`：日志、tracing、metrics
-- `server`：监听、优雅关闭、运行参数管理
+  [[server.location]]
+  path = "/docs"
+  root = "../example/docs"
 
-## 开发方式
+  [[server.location]]
+  path = "/api"
+  proxy_pass = "http://127.0.0.1:4000"
 
-克隆仓库后，可以先按标准 Rust library 的方式进行构建和测试：
+[[server]]
+listen = "127.0.0.1:3000"
+server_name = ["admin.localhost"]
+
+  [[server.location]]
+  path = "/"
+  root = "../example/admin"
+```
+
+## 路由规则
+
+- `server` 选择基于请求头里的 `Host`
+- 如果没有命中具名 `server`，会回退到该监听地址上的默认 `server`
+- `location` 使用最长前缀匹配
+- 静态 `root` 会在解析文件路径前先去掉已匹配的 `location` 前缀
+- 静态请求没有扩展名时，会依次尝试精确文件、`*.html` 和目录索引文件
+- `proxy_pass` 会按匹配到的 `location` 前缀重写路径，并保留 query string
+
+## CLI
+
+配置驱动模式：
+
+```bash
+cargo run -- --config examples/loomis.toml
+```
+
+旧的单站点静态模式：
+
+```bash
+cargo run -- --path ./example --port 3000
+```
+
+可用参数：
+
+- `--config <path>`：从 Loomis TOML 配置文件启动
+- `--path <dir>`：启动旧的单站点静态服务器
+- `--port <port>`：覆盖旧模式下的监听端口
+- `--help`、`-h`：输出帮助信息
+
+## 作为库使用
+
+运行完整的配置驱动服务：
+
+```rust
+use std::error::Error;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let config = loomis::LoomisConfig::load_from_path("examples/loomis.toml")?;
+    loomis::serve_config(&config)?;
+    Ok(())
+}
+```
+
+运行旧的单站点静态服务：
+
+```rust
+fn main() -> Result<(), loomis::ServerError> {
+    loomis::serve_html("./example", 3000)
+}
+```
+
+## 当前限制
+
+目前还没有实现：
+
+- TLS / HTTPS
+- 配置热重载
+- 负载均衡或健康检查
+- gzip、缓存、鉴权、限流
+- chunked request body
+- 完整 nginx 配置语法兼容
+
+## 开发
+
+构建和测试：
 
 ```bash
 cargo build
 cargo test
 ```
 
-如果后续扩展为完整的服务端基础库，建议优先补齐：
-
-1. crate 级模块结构
-2. 公共错误模型
-3. 配置与启动流程
-4. HTTP 抽象与中间件机制
-5. 日志与 tracing 集成
-6. 示例应用与集成测试
-
-## 项目结构
-
-当前仓库结构比较简单：
-
-```text
-.
-├── Cargo.toml
-├── README.md
-└── src
-    └── lib.rs
-```
-
-随着基础能力逐步增加，建议将目录演进为更清晰的模块结构，以便后续维护和扩展。
-
-## 愿景
-
-`Loomis` 希望成为一个适合作为 Rust Web Server 应用起点的基础库：
-
-- 比直接从零搭服务更省成本
-- 比重型框架更可控
-- 比项目内散落的工具代码更统一
-
-如果你的目标是沉淀一套长期可维护的 Rust 服务端基础设施，这个仓库就是一个合适的起点。
+本次类 nginx 化改造的实施计划位于 `docs/nginx-like-plan.md`。
 
 ## License
 
