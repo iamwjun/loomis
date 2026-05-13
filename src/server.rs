@@ -1,19 +1,24 @@
-use crate::config::{LocationConfig, LocationHandler, LoomisConfig, ServerConfig};
+use crate::config::{LocationConfig, LocationHandler, LoomisConfig, ProxyTarget, ServerConfig};
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
 pub enum ServerError {
     InvalidRootDirectory(PathBuf),
     Io(io::Error),
+    SignalHandler(String),
     ThreadPanic,
 }
 
@@ -24,6 +29,7 @@ impl fmt::Display for ServerError {
                 write!(f, "invalid html root directory: {}", path.display())
             }
             Self::Io(error) => write!(f, "{error}"),
+            Self::SignalHandler(message) => write!(f, "{message}"),
             Self::ThreadPanic => write!(f, "listener thread panicked"),
         }
     }
@@ -39,10 +45,13 @@ impl From<io::Error> for ServerError {
 
 pub fn serve_config(config: &LoomisConfig) -> Result<(), ServerError> {
     let listeners = group_servers_by_listener(config);
-    let mut handles = Vec::with_capacity(listeners.len());
+    let shutdown = Arc::new(AtomicBool::new(false));
+    install_shutdown_handler(Arc::clone(&shutdown))?;
 
+    let mut handles = Vec::with_capacity(listeners.len());
     for listener in listeners {
-        handles.push(thread::spawn(move || serve_listener(listener)));
+        let shutdown = Arc::clone(&shutdown);
+        handles.push(thread::spawn(move || serve_listener(listener, shutdown)));
     }
 
     for handle in handles {
@@ -73,70 +82,117 @@ pub fn serve_html(root_dir: impl AsRef<Path>, port: u16) -> Result<(), ServerErr
     serve_config(&config)
 }
 
-fn serve_listener(listener_config: ListenerConfig) -> Result<(), ServerError> {
+fn install_shutdown_handler(shutdown: Arc<AtomicBool>) -> Result<(), ServerError> {
+    ctrlc::set_handler(move || {
+        shutdown.store(true, Ordering::SeqCst);
+    })
+    .map_err(|error| {
+        ServerError::SignalHandler(format!("failed to install Ctrl+C handler: {error}"))
+    })
+}
+
+fn serve_listener(
+    listener_config: ListenerConfig,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), ServerError> {
     let listener = TcpListener::bind(listener_config.listen)?;
+    listener.set_nonblocking(true)?;
+
     println!(
         "Listening on http://{}/ with {} server block(s)",
         listener_config.listen,
         listener_config.servers.len()
     );
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let servers = listener_config.servers.clone();
-                thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, &servers) {
+    let servers = Arc::new(listener_config.servers);
+    let mut workers = Vec::new();
+
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let servers = Arc::clone(&servers);
+                workers.push(thread::spawn(move || {
+                    if let Err(error) = handle_connection(stream, servers.as_slice()) {
                         eprintln!("connection error: {error}");
                     }
-                });
+                }));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL_INTERVAL);
             }
             Err(error) => eprintln!("accept error: {error}"),
         }
+    }
+
+    for worker in workers {
+        let _ = worker.join();
     }
 
     Ok(())
 }
 
 fn handle_connection(mut stream: TcpStream, servers: &[ServerConfig]) -> io::Result<()> {
+    let started_at = Instant::now();
+    let remote_addr = stream.peer_addr().ok();
+
     let request = match read_http_request(&mut stream) {
         Ok(Some(request)) => request,
         Ok(None) => return Ok(()),
         Err(RequestReadError::Io(error)) => return Err(error),
         Err(RequestReadError::Malformed(message)) => {
-            return write_text_response(
+            write_text_response(
                 &mut stream,
                 "400 Bad Request",
                 &message,
                 false,
                 false,
+            )?;
+            log_access(
+                remote_addr,
+                None,
+                "-",
+                "-",
+                400,
+                started_at.elapsed(),
+                None,
             );
+            return Ok(());
         }
     };
 
     let server = select_server(servers, request.host());
-    let Some(location) = select_location(&server.locations, &request.path) else {
-        return write_text_response(
-            &mut stream,
-            "404 Not Found",
-            "No matching location block.",
-            request.is_head(),
-            false,
-        );
+    let outcome = match select_location(&server.locations, &request.path) {
+        Some(location) => match &location.handler {
+            LocationHandler::Static { root } => {
+                serve_static_location(&mut stream, &request, location, root)?
+            }
+            LocationHandler::Proxy { upstream } => {
+                proxy_request(&mut stream, &request, location, upstream, remote_addr)?
+            }
+        },
+        None => {
+            write_text_response(
+                &mut stream,
+                "404 Not Found",
+                "No matching location block.",
+                request.is_head(),
+                false,
+            )?;
+            RequestOutcome::new(404, None)
+        }
     };
 
-    match &location.handler {
-        LocationHandler::Static { root } => {
-            serve_static_location(&mut stream, &request, location, root)
-        }
-        LocationHandler::Proxy { .. } => write_text_response(
-            &mut stream,
-            "501 Not Implemented",
-            "proxy_pass support is not available yet.",
-            request.is_head(),
-            false,
-        ),
-    }
+    log_access(
+        remote_addr,
+        request.host(),
+        &request.method,
+        &request.target,
+        outcome.status_code,
+        started_at.elapsed(),
+        outcome.upstream.as_deref(),
+    );
+
+    Ok(())
 }
 
 fn serve_static_location(
@@ -144,15 +200,16 @@ fn serve_static_location(
     request: &HttpRequest,
     location: &LocationConfig,
     root: &Path,
-) -> io::Result<()> {
+) -> io::Result<RequestOutcome> {
     if !matches!(request.method.as_str(), "GET" | "HEAD") {
-        return write_text_response(
+        write_text_response(
             stream,
             "405 Method Not Allowed",
             "Only GET and HEAD requests are supported for static locations.",
             request.is_head(),
             true,
-        );
+        )?;
+        return Ok(RequestOutcome::new(405, None));
     }
 
     match resolve_static_file(root, &location.path, &request.path, &location.index) {
@@ -176,23 +233,275 @@ fn serve_static_location(
                 Some(&body),
                 content_length,
                 request.is_head(),
-            )
+            )?;
+
+            Ok(RequestOutcome::new(200, None))
         }
-        Ok(None) => write_text_response(
-            stream,
-            "404 Not Found",
-            "Static file not found.",
-            request.is_head(),
-            false,
-        ),
-        Err(PathResolutionError::TraversalAttempt) => write_text_response(
-            stream,
-            "400 Bad Request",
-            "Invalid request path.",
-            request.is_head(),
-            false,
-        ),
+        Ok(None) => {
+            write_text_response(
+                stream,
+                "404 Not Found",
+                "Static file not found.",
+                request.is_head(),
+                false,
+            )?;
+            Ok(RequestOutcome::new(404, None))
+        }
+        Err(PathResolutionError::TraversalAttempt) => {
+            write_text_response(
+                stream,
+                "400 Bad Request",
+                "Invalid request path.",
+                request.is_head(),
+                false,
+            )?;
+            Ok(RequestOutcome::new(400, None))
+        }
     }
+}
+
+fn proxy_request(
+    client_stream: &mut TcpStream,
+    request: &HttpRequest,
+    location: &LocationConfig,
+    upstream: &ProxyTarget,
+    remote_addr: Option<SocketAddr>,
+) -> io::Result<RequestOutcome> {
+    let upstream_authority = upstream.authority();
+    let mut upstream_stream = match TcpStream::connect(&upstream_authority) {
+        Ok(stream) => stream,
+        Err(_) => {
+            write_text_response(
+                client_stream,
+                "502 Bad Gateway",
+                "Failed to connect to upstream server.",
+                request.is_head(),
+                false,
+            )?;
+            return Ok(RequestOutcome::new(502, Some(upstream_authority)));
+        }
+    };
+
+    let upstream_target = build_upstream_target(
+        &upstream.base_path,
+        &location.path,
+        &request.path,
+        request.query.as_deref(),
+    );
+    let upstream_request =
+        build_upstream_request(request, &upstream_target, &upstream_authority, remote_addr);
+
+    if upstream_stream.write_all(&upstream_request).is_err() || upstream_stream.flush().is_err() {
+        write_text_response(
+            client_stream,
+            "502 Bad Gateway",
+            "Failed to send the upstream request.",
+            request.is_head(),
+            false,
+        )?;
+        return Ok(RequestOutcome::new(502, Some(upstream_authority)));
+    }
+
+    let (status_code, buffered_response) = match read_upstream_response_head(&mut upstream_stream) {
+        Ok(result) => result,
+        Err(_) => {
+            write_text_response(
+                client_stream,
+                "502 Bad Gateway",
+                "Received an invalid upstream response.",
+                request.is_head(),
+                false,
+            )?;
+            return Ok(RequestOutcome::new(502, Some(upstream_authority)));
+        }
+    };
+
+    client_stream.write_all(&buffered_response)?;
+    io::copy(&mut upstream_stream, client_stream)?;
+    client_stream.flush()?;
+
+    Ok(RequestOutcome::new(status_code, Some(upstream_authority)))
+}
+
+fn read_upstream_response_head(stream: &mut TcpStream) -> io::Result<(u16, Vec<u8>)> {
+    let mut buffer = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0_u8; 4 * 1024];
+
+    loop {
+        let read_len = stream.read(&mut chunk)?;
+        if read_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream closed before sending a response",
+            ));
+        }
+
+        buffer.extend_from_slice(&chunk[..read_len]);
+        if buffer.len() > MAX_REQUEST_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upstream response headers are too large",
+            ));
+        }
+
+        if let Some(header_end) = find_header_end(&buffer) {
+            let status_code = parse_response_status(&buffer[..header_end])?;
+            return Ok((status_code, buffer));
+        }
+    }
+}
+
+fn build_upstream_request(
+    request: &HttpRequest,
+    upstream_target: &str,
+    upstream_authority: &str,
+    remote_addr: Option<SocketAddr>,
+) -> Vec<u8> {
+    let mut payload = format!("{} {} {}\r\n", request.method, upstream_target, request.version);
+
+    for header in &request.headers {
+        if should_skip_proxy_header(&header.name) {
+            continue;
+        }
+
+        payload.push_str(&header.name);
+        payload.push_str(": ");
+        payload.push_str(&header.value);
+        payload.push_str("\r\n");
+    }
+
+    payload.push_str("Host: ");
+    payload.push_str(upstream_authority);
+    payload.push_str("\r\n");
+
+    if let Some(forwarded_for) = build_forwarded_for(request, remote_addr) {
+        payload.push_str("X-Forwarded-For: ");
+        payload.push_str(&forwarded_for);
+        payload.push_str("\r\n");
+    }
+
+    if let Some(host) = request.host() {
+        payload.push_str("X-Forwarded-Host: ");
+        payload.push_str(host);
+        payload.push_str("\r\n");
+    }
+
+    payload.push_str("X-Forwarded-Proto: http\r\n");
+    payload.push_str("Connection: close\r\n");
+    payload.push_str(&format!("Content-Length: {}\r\n\r\n", request.body.len()));
+
+    let mut bytes = payload.into_bytes();
+    bytes.extend_from_slice(&request.body);
+    bytes
+}
+
+fn build_upstream_target(
+    base_path: &str,
+    location_path: &str,
+    request_path: &str,
+    query: Option<&str>,
+) -> String {
+    let suffix = strip_location_prefix(location_path, request_path);
+    let joined = join_paths(base_path, suffix);
+
+    match query {
+        Some(query) if !query.is_empty() => format!("{joined}?{query}"),
+        _ => joined,
+    }
+}
+
+fn join_paths(base_path: &str, suffix: &str) -> String {
+    let base = if base_path.is_empty() { "/" } else { base_path };
+    let normalized_suffix = suffix.trim_start_matches('/');
+
+    if base == "/" {
+        if normalized_suffix.is_empty() {
+            String::from("/")
+        } else {
+            format!("/{normalized_suffix}")
+        }
+    } else if normalized_suffix.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), normalized_suffix)
+    }
+}
+
+fn should_skip_proxy_header(header_name: &str) -> bool {
+    header_name.eq_ignore_ascii_case("connection")
+        || header_name.eq_ignore_ascii_case("content-length")
+        || header_name.eq_ignore_ascii_case("host")
+        || header_name.eq_ignore_ascii_case("proxy-connection")
+        || header_name.eq_ignore_ascii_case("x-forwarded-for")
+        || header_name.eq_ignore_ascii_case("x-forwarded-host")
+        || header_name.eq_ignore_ascii_case("x-forwarded-proto")
+}
+
+fn build_forwarded_for(request: &HttpRequest, remote_addr: Option<SocketAddr>) -> Option<String> {
+    let mut segments = Vec::new();
+
+    if let Some(existing) = request.header("x-forwarded-for") {
+        let existing = existing.trim();
+        if !existing.is_empty() {
+            segments.push(existing.to_string());
+        }
+    }
+
+    if let Some(remote_addr) = remote_addr {
+        segments.push(remote_addr.ip().to_string());
+    }
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments.join(", "))
+    }
+}
+
+fn log_access(
+    remote_addr: Option<SocketAddr>,
+    host: Option<&str>,
+    method: &str,
+    target: &str,
+    status_code: u16,
+    duration: Duration,
+    upstream: Option<&str>,
+) {
+    println!(
+        "{}",
+        format_access_log(
+            remote_addr,
+            host,
+            method,
+            target,
+            status_code,
+            duration,
+            upstream
+        )
+    );
+}
+
+fn format_access_log(
+    remote_addr: Option<SocketAddr>,
+    host: Option<&str>,
+    method: &str,
+    target: &str,
+    status_code: u16,
+    duration: Duration,
+    upstream: Option<&str>,
+) -> String {
+    format!(
+        "remote={} host={} method={} target=\"{}\" status={} duration_ms={} upstream={}",
+        remote_addr
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| String::from("-")),
+        host.unwrap_or("-"),
+        method,
+        target,
+        status_code,
+        duration.as_millis(),
+        upstream.unwrap_or("-")
+    )
 }
 
 fn group_servers_by_listener(config: &LoomisConfig) -> Vec<ListenerConfig> {
@@ -484,6 +793,15 @@ fn parse_request_target(target: &str) -> Result<(String, Option<String>), Reques
 }
 
 fn parse_content_length(headers: &[HttpHeader]) -> Result<usize, RequestReadError> {
+    if headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return Err(RequestReadError::Malformed(String::from(
+            "Transfer-Encoding is not supported.",
+        )));
+    }
+
     let Some(value) = headers
         .iter()
         .find(|header| header.name.eq_ignore_ascii_case("content-length"))
@@ -497,6 +815,26 @@ fn parse_content_length(headers: &[HttpHeader]) -> Result<usize, RequestReadErro
             "Content-Length must be a positive integer.",
         ))
     })
+}
+
+fn parse_response_status(buffer: &[u8]) -> io::Result<u16> {
+    let response = std::str::from_utf8(buffer)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "upstream response is not UTF-8"))?;
+    let status_line = response
+        .split("\r\n")
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing status line"))?;
+    let mut parts = status_line.split_whitespace();
+    let _version = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP version"))?;
+    let status_code = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing status code"))?
+        .parse::<u16>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid status code"))?;
+
+    Ok(status_code)
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
@@ -580,6 +918,21 @@ struct ListenerConfig {
 }
 
 #[derive(Debug)]
+struct RequestOutcome {
+    status_code: u16,
+    upstream: Option<String>,
+}
+
+impl RequestOutcome {
+    fn new(status_code: u16, upstream: Option<String>) -> Self {
+        Self {
+            status_code,
+            upstream,
+        }
+    }
+}
+
+#[derive(Debug)]
 enum PathResolutionError {
     TraversalAttempt,
 }
@@ -602,11 +955,15 @@ struct HttpRequest {
 }
 
 impl HttpRequest {
-    fn host(&self) -> Option<&str> {
+    fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
-            .find(|header| header.name.eq_ignore_ascii_case("host"))
+            .find(|header| header.name.eq_ignore_ascii_case(name))
             .map(|header| header.value.as_str())
+    }
+
+    fn host(&self) -> Option<&str> {
+        self.header("host")
     }
 
     fn is_head(&self) -> bool {
@@ -623,7 +980,6 @@ struct HttpHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProxyTarget;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -776,6 +1132,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_transfer_encoding_requests() {
+        let request = parse_request_head(
+            b"POST /upload HTTP/1.1\r\nHost: example.test\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .expect("request should parse");
+
+        let error =
+            parse_content_length(&request.headers).expect_err("transfer-encoding should fail");
+
+        assert!(matches!(error, RequestReadError::Malformed(message) if message == "Transfer-Encoding is not supported."));
+    }
+
+    #[test]
     fn normalizes_host_without_port() {
         assert_eq!(
             normalize_host(Some("Example.TEST:8080")),
@@ -814,6 +1183,83 @@ mod tests {
 
         assert_eq!(listeners.len(), 1);
         assert_eq!(listeners[0].servers.len(), 2);
+    }
+
+    #[test]
+    fn builds_upstream_target_from_location_suffix() {
+        let upstream_target = build_upstream_target(
+            "/backend",
+            "/api",
+            "/api/users",
+            Some("page=1"),
+        );
+
+        assert_eq!(upstream_target, "/backend/users?page=1");
+    }
+
+    #[test]
+    fn builds_upstream_request_with_forwarded_headers() {
+        let request = HttpRequest {
+            method: String::from("POST"),
+            target: String::from("/api/items"),
+            path: String::from("/api/items"),
+            query: None,
+            version: String::from("HTTP/1.1"),
+            headers: vec![
+                HttpHeader {
+                    name: String::from("Host"),
+                    value: String::from("example.test"),
+                },
+                HttpHeader {
+                    name: String::from("Content-Type"),
+                    value: String::from("application/json"),
+                },
+                HttpHeader {
+                    name: String::from("X-Forwarded-For"),
+                    value: String::from("203.0.113.10"),
+                },
+            ],
+            body: br#"{"name":"loomis"}"#.to_vec(),
+        };
+
+        let outbound = build_upstream_request(
+            &request,
+            "/backend/items",
+            "127.0.0.1:4000",
+            Some("198.51.100.8:9000".parse::<SocketAddr>().expect("socket should parse")),
+        );
+        let outbound = String::from_utf8(outbound).expect("request should be utf-8");
+
+        assert!(outbound.contains("POST /backend/items HTTP/1.1\r\n"));
+        assert!(outbound.contains("Host: 127.0.0.1:4000\r\n"));
+        assert!(outbound.contains("X-Forwarded-For: 203.0.113.10, 198.51.100.8\r\n"));
+        assert!(outbound.contains("X-Forwarded-Host: example.test\r\n"));
+    }
+
+    #[test]
+    fn parses_upstream_status_line() {
+        let status = parse_response_status(b"HTTP/1.1 204 No Content\r\nContent-Length: 0")
+            .expect("status line should parse");
+
+        assert_eq!(status, 204);
+    }
+
+    #[test]
+    fn formats_access_log_line() {
+        let line = format_access_log(
+            Some("127.0.0.1:8080".parse::<SocketAddr>().expect("socket should parse")),
+            Some("example.test"),
+            "GET",
+            "/api/users",
+            200,
+            Duration::from_millis(42),
+            Some("127.0.0.1:4000"),
+        );
+
+        assert_eq!(
+            line,
+            "remote=127.0.0.1:8080 host=example.test method=GET target=\"/api/users\" status=200 duration_ms=42 upstream=127.0.0.1:4000"
+        );
     }
 
     fn build_server(listen: &str, server_names: Vec<String>, locations: Vec<LocationConfig>) -> ServerConfig {

@@ -10,6 +10,10 @@ server_name = ["localhost", "site.localhost"]
   path = "/docs"
   root = "../example/docs"
 
+  [[server.location]]
+  path = "/api"
+  proxy_pass = "http://127.0.0.1:4000"
+
 [[server]]
 listen = "127.0.0.1:3000"
 server_name = ["admin.localhost"]

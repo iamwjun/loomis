@@ -10,5 +10,6 @@ keywords = ["ansi", "cli", "color", "terminal"]
 categories = ["command-line-interface"]
 
 [dependencies]
+ctrlc = "3.4"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
