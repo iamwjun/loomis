@@ -1,0 +1,12 @@
+[package]
+name = "loomis"
+version = "0.0.1"
+edition = "2024"
+description = "Rust web server."
+license = "MIT"
+repository = "https://github.com/iamwjun/loomis"
+readme = "README.md"
+keywords = ["ansi", "cli", "color", "terminal"]
+categories = ["command-line-interface"]
+
+[dependencies]
