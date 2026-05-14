@@ -1,13 +1,13 @@
 [package]
 name = "loomis"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 description = "Rust web server."
 license = "MIT"
 repository = "https://github.com/iamwjun/loomis"
 readme = "README.md"
-keywords = ["ansi", "cli", "color", "terminal"]
-categories = ["command-line-interface"]
+keywords = ["nginx", "reverse-proxy", "http-server", "static-files", "virtual-hosts"]
+categories = ["web-programming::http-server", "network-programming", "command-line-utilities"]
 
 [dependencies]
 ctrlc = "3.4"
